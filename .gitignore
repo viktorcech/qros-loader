@@ -1,0 +1,19 @@
+# build tool (download MADS separately)
+mads.exe
+
+# build outputs
+qrosload.bin
+*.lst
+*.lab
+
+# python
+__pycache__/
+*.pyc
+
+# tapes / scratch
+*.cas
+*.bak
+/_zal/
+
+# editor / agent
+.claude/
