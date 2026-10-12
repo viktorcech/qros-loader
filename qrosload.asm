@@ -69,14 +69,12 @@ CHBAS   = $02F4
 ; ---- nulta stranka (volne bajty $CB-$D1 na XL/XE) --------------------------
 ; Zapisy programu do nultej stranky idu do tiena ZPSHAD, takze tieto bajty
 ; segment neprepise; skutocna nulta stranka dostane tien pred INIT a RUN.
-WPTR    = $CB                   ; ukazovatel zapisu (nizky bajt vzdy 0)
 DPAGE   = $CD                   ; stranka ciela segmentu
 SEGCNT  = $CE                   ; -(zostavajuca dlzka segmentu), ide hore k 0
 DSTY    = $D0                   ; nizky bajt ciela medzi behmi kopirovania
 SUM     = $D1                   ; kontrolny sucet prijimaneho bloku
 QSRC    = $CB                   ; stub: zdroj behu qrosos (2 B)
 QDST    = $CD                   ; stub: ciel behu (2 B)
-QLEN    = $CF                   ; stub: dlzka behu
 
 ; ---- RAM pod OS ROM (loader v kopii FP ROM $D800-$DFFF) --------------------
 LOADER_LO = $D8                 ; stranky loadera: chranene pred zapisom
@@ -101,16 +99,16 @@ collide    = zvars+3            ; program sa pokusil prepisat loader
 name_shown = zvars+4
 pct        = zvars+5
 acc        = zvars+6            ; akumulator percent (2 B)
-baudidx    = zvars+8            ; offset skusanej rychlosti v baudtab (0..6)
-baudtab    = zvars+9            ; styri skusane POKEY delice (8 B)
-cdig       = zvars+17           ; desiatkove pocitadlo nacitanych blokov (4 B)
-totblk     = zvars+21           ; pocet blokov pasky z konca blobu (2 B)
-dl_last    = zvars+23           ; naposledy zapisany display list (2 B)
-dm_last    = zvars+25           ; a DMACTL - ANTIC berie zapis hned, aj uprostred
-bootimg    = zvars+26           ; snimky, preto len pri zmene tienov
-gapcur     = zvars+27           ; bootimg != 0: nahrava sa bootovaci obraz
-gapnext    = zvars+28           ; gapcur/gapnext: tento/dalsi blok zacal po medzere
-zvars_end  = zvars+29
+baudidx    = zvars+8            ; index skusanej rychlosti v baudtab (0..3)
+baudtab    = zvars+9            ; styri skusane POKEY delice (AUDF3; AUDF4 = 0)
+cdig       = zvars+13           ; desiatkove pocitadlo nacitanych blokov (4 B)
+totblk     = zvars+17           ; pocet blokov pasky z konca blobu (2 B)
+dl_last    = zvars+19           ; naposledy zapisany display list (2 B)
+dm_last    = zvars+21           ; a DMACTL - ANTIC berie zapis hned, aj uprostred
+bootimg    = zvars+22           ; snimky, preto len pri zmene tienov
+gapcur     = zvars+23           ; bootimg != 0: nahrava sa bootovaci obraz
+gapnext    = zvars+24           ; gapcur/gapnext: tento/dalsi blok zacal po medzere
+zvars_end  = zvars+25
 scrline    = zvars_end          ; textovy riadok (40 B)
 VARS_END   = scrline+40
 
@@ -197,7 +195,7 @@ qr_next:
     ldy #2
     lda (QSRC),y                ; dlzka behu (1..255); 0 = koniec
     beq qr_done
-    sta QLEN
+    tax                         ; X = dlzka (qr_adv X nemeni)
     dey
     lda (QSRC),y                ; adresa (aj nulta stranka)
     sta QDST+1
@@ -206,7 +204,6 @@ qr_next:
     sta QDST
     lda #3                      ; QSRC += 3 (hlavicka behu)
     jsr qr_adv
-    ldx QLEN
     ldy #0
 qr_copy:
     lda (QSRC),y
@@ -214,7 +211,7 @@ qr_copy:
     iny
     dex
     bne qr_copy
-    lda QLEN                    ; QSRC += dlzka behu
+    tya                         ; Y = dlzka behu: QSRC += dlzka
     jsr qr_adv
     jmp qr_next
 qr_adv:
@@ -435,7 +432,6 @@ e_coll:
 
 start:
     lda #0
-    sta WPTR
     ldx #zvars_end - zvars      ; vynulovanie stavu
 clr_vars:
     sta zvars-1,x
@@ -447,7 +443,7 @@ clr_vars:
 ; Skusane delice: zadany, o 4 mensi, druha bezna QROS rychlost, o 4 mensia.
 ; Zaznam z emulatora ma presnu rychlost delica a jeho dekoder vzorkuje bity
 ; neskoro - precita ho az prijimac o ~3 % rychlejsi. Realna paska ide hned
-; prvym. Delice su 8-bitove, vysoke bajty ostavaju 0.
+; prvym. Delice su 8-bitove (AUDF4 = 0), z baudiv sa cita len nizky bajt.
     lda baudiv
     sta baudtab
     ldx #POKEY_AUDF_6600
@@ -455,13 +451,13 @@ clr_vars:
     beq bi_alt
     ldx #POKEY_AUDF_9600
 bi_alt:
-    stx baudtab+4
+    stx baudtab+2
     sec
     sbc #4
-    sta baudtab+2
+    sta baudtab+1
     txa                         ; C=1: delice > 4, sbc nepozicia
     sbc #4
-    sta baudtab+6
+    sta baudtab+3
 
     lda #2                      ; datove bloky zacinaju indexom 2
     sta exp_lo
@@ -519,46 +515,67 @@ cl_eof:                         ; koniec pasky uprostred segmentu je chyba; pri
     lda bootimg                 ; boot obraze moze byt posledny zaznam kratsi,
     jeq far_sync                ; nez hovori hlavicka - OS bootu to nevadi
     jmp load_done
+cl_more:                        ; blok minuty -> dalsi (bufcnt 1..128); mimo
+    jsr next_block              ; slucky behov, aby jej koniec dosiahol cl_run
+    bcs cl_eof                  ; koniec pasky uprostred segmentu
+    lda #0
+    sta bufpos
+    lda bufcnt                  ; Z=0
+    bne cl_avail
 seg_ok:
 
 
 ;-----------------------------------------------------------------------------
-; Kopirovanie segmentu po behoch: beh = zvysok bloku alebo zvysok segmentu,
-; co je kratsie. V behu ide X hore k nule (zdroj, operand lda je posunuty),
-; Y je nizky bajt ciela, WPTR+1 stranka zapisu podla cl_chk.
+; Kopirovanie segmentu po behoch: beh = zvysok bloku, zvysok segmentu alebo
+; zvysok stranky ciela, co je najkratsie - beh nikdy neprekroci stranku, takze
+; obe strany idu cez abs,x s X hore k nule (operandy su posunute o koniec
+; behu - 256). Zahodeny beh (chranena stranka, hardver) sa zapisuje spat do
+; zdroja: prepis tym istym bajtom nic nespravi.
 ; Vstup: DPAGE:DSTY = ciel, SEGCNT = -dlzka (aj z boot_img).
 ;-----------------------------------------------------------------------------
 copy_seg:
-    jsr cl_chk                  ; zapis podla prvej stranky
-    bcc cl_run
-    sta collide                 ; A != 0: do chranenej stranky ide bajt
 cl_run:
     lda bufcnt                  ; A = zvysok bloku (bufpos <= bufcnt)
     sec
     sbc bufpos
-    bne cl_avail
-    jsr next_block              ; blok minuty -> dalsi (bufcnt 1..128)
-    bcs cl_eof                  ; koniec pasky uprostred segmentu
-    lda #0
-    sta bufpos
-    lda bufcnt
+    beq cl_more                 ; blok minuty: dalsi blok (cl_more je pred nami)
 cl_avail:                       ; A = zvysok bloku (1..128)
     ldx SEGCNT+1                ; zvysok segmentu >= 256 -> cely zvysok bloku
     inx
-    bne cl_take
+    bne cl_blk
     tax
     clc
     adc SEGCNT                  ; C=1: zvysok bloku >= zvysok segmentu (-SEGCNT)
     txa
-    bcc cl_take
+    bcc cl_blk
     lda #0                      ; beh = -SEGCNT (C=1 z adc)
     sbc SEGCNT
-cl_take:                        ; A = dlzka behu
-    tay
-    eor #$FF                    ; X = -beh, ide hore k nule
+cl_blk:                         ; A = min(blok, segment), 1..128
     tax
-    inx
-    tya
+    jsr cl_chk                  ; Y = stranka zapisu (0 = zahodit); A nemeni
+    bcc cl_pg
+    sta collide                 ; A = beh != 0: do chranenej stranky ide bajt
+cl_pg:
+    txa
+    clc
+    adc DSTY                    ; koniec behu v stranke ciela
+    bcc cl_fit                  ; < 256
+    beq cl_fit                  ; = 256: presne po koniec stranky (C=1)
+    lda #0                      ; cez koniec stranky: beh = 256 - DSTY
+    sbc DSTY                    ; (C=1; DSTY != 0, takze potom C=0)
+    tax
+    lda #0                      ; koniec behu = 256
+    sec
+cl_fit:                         ; X = beh, A = koniec behu = novy DSTY, C = (koniec = 256)
+    sta cl_st+1
+    sta DSTY
+    bne cl_hi                   ; Z z poslednej ALU operacie (adc / lda #0)
+    inc DPAGE                   ; dalsi beh zacina v dalsej stranke
+cl_hi:
+    tya                         ; stranka zapisu - 1 + C (inc, sta, bne C nemenia)
+    adc #$FF
+    sta cl_st+2
+    txa
     clc
     adc SEGCNT                  ; SEGCNT += beh
     sta SEGCNT
@@ -566,30 +583,32 @@ cl_take:                        ; A = dlzka behu
     inc SEGCNT+1
     clc
 cl_lim:                         ; C=0
-    tya
+    txa
     adc bufpos                  ; koniec behu = nova pozicia v bufri (<= 128)
     sta bufpos
-    adc #<[BUFADR+3-256]        ; C=0; lda base,x s X = -beh..-1
-    sta cl_ld+1
+    adc #<[BUFADR+3-256]        ; C=0; lda base,x s X = -beh..-1; bez prenosu
+    sta cl_ld+1                 ; (ert nizsie), vysoky bajt operandu je pevny
+    tya
+    bne cl_go
+    lda cl_ld+1                 ; zahodeny beh: ciel = zdroj
+    sta cl_st+1
     lda #>[BUFADR+3-256]
-    adc #0
-    sta cl_ld+2
-    ldy DSTY
+    sta cl_st+2
+cl_go:
+    txa
+    eor #$FF                    ; X = -beh, ide hore k nule
+    tax
+    inx
 
-; Cely blok (koniec behu 128) cita data bloku bez prechodu stranky:
-; 19 cyklov na bajt, kratsi beh 20.
+; 15 cyklov na bajt (citanie krizi stranku: operand je o stranku nizsie).
 cl_ld:
-    lda a:$0000,x               ; SMC: BUFADR+3 + koniec behu - 256
+    lda a:BUFADR+3-256,x        ; SMC nizky bajt: + koniec behu
 cl_st:
-    sta (WPTR),y                ; SMC: bit WPTR, ak sa do stranky nezapisuje
-    iny
-    beq cl_page                 ; raz za 256 bajtov, mimo slucky
-cl_inx:
+    sta a:$0000,x               ; SMC: ciel + koniec behu - 256, alebo zdroj
     inx
     bne cl_ld
     ert >cl_ld <> >*            ; slucka v jednej stranke
 
-    sty DSTY
     lda SEGCNT
     ora SEGCNT+1
     bne cl_run                  ; segment pokracuje v dalsom bloku
@@ -606,25 +625,9 @@ do_init:
     jsr zp_get                  ; co v nej INIT zmenil, ostava v tieni
     lda #0
     sta INITAD+1
-    sta WPTR                    ; INIT (alebo tien) mohol prepisat nas ZP
     jsr scr_sync                ; obraz podla tienov (INIT ich mohol zmenit)
     jsr ser_init                ; INIT mohol zmenit POKEY aj motor
     jmp seg_loop
-
-; --- zriedkave vetvy kopirovania --------------------------------------------
-cl_page:
-    inc DPAGE
-    jsr cl_chk
-    ldy #0
-    bcc cl_inx                  ; zapisovatelna stranka alebo hardver
-    cpx #$FF                    ; pojde do nej este bajt? (tento beh alebo dalsi)
-    bne cl_hit
-    lda SEGCNT
-    ora SEGCNT+1
-    beq cl_inx
-cl_hit:
-    sta collide                 ; A != 0
-    jmp cl_inx
 
 ;-----------------------------------------------------------------------------
 ; Bootovaci obraz (ako OS boot z kazety): hlavicka = priznaky,
@@ -642,12 +645,12 @@ boot_img:
     beq bi_sync                 ; 0 zaznamov nie je obraz
     sta bootimg
     lsr                         ; cele stranky, C = +128 B
-    eor #$FF                    ; A = -stranky - 1
+    eor #$FF                    ; A = -stranky - 1 (eor C nemeni)
     tax
-    lda #$80
-    bcs bi_cnt
-    inx                         ; parny pocet: -stranky, 0 B navyse
     lda #0
+    ror                         ; A = $80 pri neparnom pocte, inak 0
+    bne bi_cnt
+    inx                         ; parny pocet: -stranky, 0 B navyse
 bi_cnt:
     sta SEGCNT
     stx SEGCNT+1
@@ -679,30 +682,26 @@ bi_cnt:
     sta bufpos
     jmp copy_seg
 
-; cl_chk - zapis v slucke podla stranky DPAGE: $00 -> tien ZPSHAD, $01 a
-; stranky loadera -> chranene (zahodit, kolizia), $D0-$D7 hardver (zahodit),
-; vsetko ostatne priamo (aj kopia OS pod ROM).
-; Vystup: C=1 chranena (A != 0).  Nici: A
+; cl_chk - stranka zapisu behu podla DPAGE: $00 -> tien ZPSHAD, $01 a stranky
+; loadera -> chranene (zahodit, kolizia), $D0-$D7 hardver (zahodit), vsetko
+; ostatne priamo (aj kopia OS pod ROM).
+; Vystup: Y = stranka zapisu, 0 = zahodit; C=1 chranena.  Nici: Y (A nie)
 cl_chk:
-    lda DPAGE
+    ldy DPAGE
     beq ck_zp
-    cmp #1
-    beq ck_drop                 ; stranka zasobnika; C=1 z cmp
-    cmp #$D0
+    cpy #1
+    beq ck_drop                 ; stranka zasobnika; C=1 z cpy
+    cpy #$D0
     bcc ck_free                 ; RAM pod $D000
-    cmp #LOADER_HI
+    cpy #LOADER_HI
     bcs ck_free                 ; kopia OS za loaderom
-    cmp #LOADER_LO              ; C=1 loader ($D8-$DF), C=0 hardver ($D0-$D7)
+    cpy #LOADER_LO              ; C=1 loader ($D8-$DF), C=0 hardver ($D0-$D7)
 ck_drop:
-    lda #$24                    ; bit zp: zapis sa zahodi (A != 0 pre collide)
-    sta cl_st
+    ldy #0
     rts
 ck_zp:
-    lda #>ZPSHAD
+    ldy #>ZPSHAD
 ck_free:
-    sta WPTR+1
-    lda #$91                    ; sta (zp),y
-    sta cl_st
     clc
     rts
 
@@ -966,8 +965,8 @@ sb_have:
 next_baud:
     lda baudidx
     clc
-    adc #2
-    and #7                      ; 4 polozky x 2 B
+    adc #1
+    and #3                      ; 4 polozky
     sta baudidx
 
 ser_init:
@@ -976,13 +975,13 @@ ser_init:
     lda #$A0                    ; ciste tony, hlasitost 0
     sta AUDC3
     sta AUDC4
-    ldx baudidx                 ; 0..6 = offset v baudtab
+    ldx baudidx                 ; 0..3
     lda baudtab,x
     sta AUDF3
-    lda baudtab+1,x
-    sta AUDF4
-    lda #0                      ; init mod resetuje prijimac (zapis $13 pri
-    sta SKCTL                   ; SKCTL=$13 by nic nespravil), ako OS sio.s
+    lda #0
+    sta AUDF4                   ; delic je 8-bitovy
+    sta SKCTL                   ; init mod resetuje prijimac (zapis $13 pri
+                                ; SKCTL=$13 by nic nespravil), ako OS sio.s
     sta SKRES
     sta IRQEN                   ; IRQEN len tu (druhy zapis by zahodil
     lda #$13                    ; prave prijimany bajt)
@@ -1083,10 +1082,7 @@ sy_col:
     bne sy_dl
     lda SDLSTH
     cmp dl_last+1
-    bne sy_dl
-    lda SDMCTL
-    cmp dm_last
-    beq sy_ret
+    beq sy_dm
 sy_dl:
     lda SDLSTL
     sta dl_last
@@ -1094,7 +1090,10 @@ sy_dl:
     lda SDLSTH
     sta dl_last+1
     sta DLISTH
+sy_dm:
     lda SDMCTL
+    cmp dm_last
+    beq sy_ret
     sta dm_last
     sta DMACTL
 sy_ret:
@@ -1143,13 +1142,10 @@ sn_copy:
     beq sn_fill
     and #$7F                    ; ATASCII -> obrazovy kod
     cmp #$60
+    bcs sn_put                  ; $60-$7F: rovnaky kod
+    sbc #$1F                    ; C=0: -$20; $20-$5F -> $00-$3F, C=1
     bcs sn_put
-    cmp #$20
-    bcc sn_ctrl
-    sbc #$20                    ; C=1 z cmp, ostane 1
-    bcs sn_put
-sn_ctrl:
-    adc #$40                    ; C=0 z cmp
+    adc #$60                    ; C=0: $00-$1F (+$E0) -> $40-$5F
 sn_put:
     sta scrline+NAMECOL,y
     iny
@@ -1281,6 +1277,7 @@ dlist
 MAIN_LEN = * - main_load
     ert MAIN_ADR + [[MAIN_LEN + 255] & $FF00] > [LOADER_HI * 256]  ; kod po strankach do $DFFF
     ert >[BUFADR + 3] <> >[BUFADR + 130]             ; data bloku v jednej stranke
+    ert <[BUFADR + 3] > 127                          ; cl_ld: nizky bajt + 128 bez prenosu
     ert BUFADR + 132 > ZPSHAD                        ; buffer pred tienom
     ert VARS_END > BUFADR                            ; premenne pred bufferom
     ert >VARS <> LOADER_LO
