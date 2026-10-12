@@ -15,8 +15,8 @@ It reads a QROS tape (132-byte blocks, SIO frames on POKEY's serial input) and p
 
 The loader takes no memory away from the program:
 
-1. The stub (loaded at `$0700`) copies the OS ROM into the RAM underneath it (`$C000-$CFFF`, `$E000-$FFFF`), applies the **QROS OS** modifications from `qrosos.inc` to that copy (the cassette handler `C:` in RAM — the same OS environment QROS itself installs, so programs like DETURBO run and can save through `C:`), and moves itself into the floating-point ROM area `$D800-$DFFF`.
-2. The tape is loaded with the OS ROM switched off. The stub's memory at `$0700` now belongs to the program. Writes to the zero page go to a shadow and are put in place before every `INIT` and before `RUN`; writes into the loader's own pages or the stack page are refused and reported.
+1. The stub (loaded at `$0700` from tape, at `$4000` as a file) copies the OS ROM into the RAM underneath it (`$C000-$CFFF`, `$E000-$FFFF`), applies the **QROS OS** modifications from `qrosos.inc` to that copy (the cassette handler `C:` in RAM — the same OS environment QROS itself installs, so programs like DETURBO run and can save through `C:`), and moves itself into the floating-point ROM area `$D800-$DFFF`.
+2. The tape is loaded with the OS ROM switched off. The stub's memory now belongs to the program. Writes to the zero page go to a shadow and are put in place before every `INIT` and before `RUN`; writes into the loader's own pages or the stack page are refused and reported.
 3. Before the program starts, `$D800-$DFFF` is restored from the ROM, so the loader leaves no trace. The program runs with the ROM off (QROS OS in RAM) and BASIC off, and may use `$0000-$BFFF` except the stack page — about 47 KB.
 
 ## Screen and keyboard
@@ -47,11 +47,11 @@ On failure the loader stops, prints the reason on its text line and colours the 
 Requires **[Mad Assembler (MADS)](https://github.com/tebe6502/Mad-Assembler)**. `qrosos.inc` must sit next to `qrosload.asm`. Two variants come out of the same source:
 
 ```
-mads qrosload.asm -d:BOOT=0 -d:LOADADR=$0700 -d:DIVISOR=127 -o:qrosload.xex
+mads qrosload.asm -d:BOOT=0 -d:LOADADR=$4000 -d:DIVISOR=127 -o:qrosload.xex
 mads qrosload.asm -d:BOOT=1 -d:LOADADR=$0700 -d:DIVISOR=127 -o:qrosload.bin
 ```
 
-- `BOOT=0` — a standalone `.xex` (included here as `qrosload.xex`): load it from disk, then start the tape.
+- `BOOT=0` — a standalone `.xex` (included here as `qrosload.xex`): load it from disk, SIO2SD, SIDE or any XEX loader, then start the tape. It loads at `$4000`, above the memory those loaders and DOS use, so it does not overwrite them while loading; once it has moved under the OS ROM that memory is free again.
 - `BOOT=1` — a raw blob with a 6-byte cassette boot header (37 boot records), to be written at the head of a QROS tape by a tape generator.
 
 `DIVISOR` is the POKEY serial divisor — `baud = clock / (2 * (DIVISOR + 7))`; `127` is the "6600" mode, `86` the "9600" mode. It only picks which speed is tried *first*.

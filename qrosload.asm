@@ -114,7 +114,9 @@ VARS_END   = scrline+40
 
 ; ---- parametre z prikazoveho riadku (-d:) ----------------------------------
 ; BOOT    = 1 -> bootovaci blob pre pasku, 0 -> samostatny XEX
-; LOADADR = adresa nahrania blobu (po starte patri programu)
+; LOADADR = adresa nahrania blobu (po starte patri programu): paska $0700
+;           (OS boot), XEX $4000 - zavadzace (SIO2SD, SIDE, DOS) ziju v
+;           $0700-$3FFF a subor nahrany cez ne ich nesmie prepisat
 ; DIVISOR = POKEY delic:  baud = takt / (2 * (DIVISOR + 7))
 ;           127 -> 6617 baud PAL (rezim "6600"),  86 -> 9535 baud PAL
 
@@ -171,12 +173,10 @@ entry:
     stx DMACTL                  ; obraz von pocas kopirovania
 
     lda PORTB                   ; bez BASICu; bit 0: ROM zapnuta / vypnuta
-    ora #$03                    ; (do predlohy trampoliny, kopiruje sa az potom)
+    ora #$03
     sta cr_on+1
-    sta tramp_load+[tramp.fr_on+1-TRAMP_ADR]
     and #$FE
     sta cr_off+1
-    sta tramp_load+[tramp.fr_off+1-TRAMP_ADR]
 
     lda #$C0                    ; OS ROM -> RAM: $C000-$CFFF a $E000-$FFFF
     ldx #$D0                    ; ($D800-$DFFF obnovi trampolina pred startom)
@@ -298,11 +298,16 @@ tramp_load:
     .local tramp, TRAMP_ADR
 
 ; init - INIT segmentu bezi ako pod DOS (VBI aj IRQ, bez serioveho prijmu),
-; ale uz s vypnutou ROM: vidi QROS OS v RAM.
+; ale uz s vypnutou ROM: vidi QROS OS v RAM. INIT smie prepnut PORTB (banky
+; 130XE, ROM $FF): banka ostava (dalsi segment ide do nej), ROM ide von,
+; inak by sa loader pod nou stratil.
 init:
     jsr irq_on
     jsr call_init
     sei
+    lda PORTB
+    and #$FE
+    sta PORTB
     lda #0
     sta NMIEN
     rts
@@ -320,8 +325,14 @@ call_casini:
     jmp (CASINI)
 
 ; run - obnovi FP ROM $D800-$DFFF (prepise loader), zapne prerusenia cez
-; vektory kopie OS a spusti program s vypnutou ROM.
+; vektory kopie OS a spusti program s vypnutou ROM; banku z posledneho INIT
+; necha.
 run:
+    lda PORTB                   ; PORTB programu, ROM von (tramp.init)
+    ora #$01
+    sta fr_on+1
+    eor #$01
+    sta fr_off+1
     ldx #0
 fr_off:
     ldy #0                      ; SMC: PORTB bez ROM (v Y, takto ostane)
@@ -355,7 +366,7 @@ irq_on:                         ; obvykle IRQ (BREAK + klavesnica) a VBI
 
     .endl
 tramp_len = * - tramp_load
-    ert tramp_len > 96
+    ert tramp_len > 112         ; zasobniku ostava aspon 144 B (kopia cez bpl: < 128)
 
 ;=============================================================================
 ; Konstantne data pod ROM (stub ich skopiruje na CDATA): texty a tabulky chyb
