@@ -10,10 +10,16 @@ qrosload.bin
 __pycache__/
 *.pyc
 
-# tapes / scratch
+# tapes, third-party sources, tools, scratch - not part of the repo
 *.cas
 *.bak
-/_zal/
+build.py
+cas/
+alt-src/
+mads-src/
+qros-generator-main/
+tools/
+_zal*/
 
 # editor / agent
 .claude/

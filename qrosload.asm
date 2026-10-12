@@ -1,20 +1,24 @@
 ;=============================================================================
-; QROS / EMO turbo tape loader pre Atari XE/XL
+; QROS LOADER V2, W1K 2026 (AI) - turbo tape loader pre Atari XE/XL
 ;
 ; Nacita QROS pasku (132-bajtove bloky, SIO ramce cez POKEY seriovy vstup),
 ; za behu parsuje Atari binarny format (XEX) a spusti program.
 ; Pocas nahravania ukazuje nazov programu z hlavicky a percenta.
 ;
-; Prekladac: MADS (mads.exe), pozri build_loader.py
+; Loader pracuje v RAM pod OS ROM: na starte skopiruje OS ROM do RAM
+; ($C000-$CFFF, $E000-$FFFF), sam bezi v kopii FP ROM ($D800-$DFFF) a pred
+; startom programu ju z ROM obnovi. Program bezi s vypnutou ROM (QROS OS):
+; do kopie OS stub zapise upravy QROS OS (qrosos.inc), takze
+; programy ako DETURBO maju kazetovy handler C: v QROS rezime. Program moze
+; zabrat $0000-$BFFF okrem stranky zasobnika, BASIC je vypnuty.
+;
+; Prekladac: MADS (mads.exe), pozri build.py
 ;   mads qrosload.asm -d:BOOT=1 ... -o:qrosload.bin   ; surovy blob pre boot
 ;   mads qrosload.asm -d:BOOT=0 ... -o:qrosload.xex   ; spustitelny XEX
 ;
 ; QROS system & SW: Ing. Matus Zubor
 ; QROS HW ozivenie (2025): Aleister
-; Loader: W1K
-;
-; Hodnoty POKEY registrov overene proti zdrojakom Altirra kernelu
-; (Kernel/source/Shared/sio.s, cassette.s, boot.s).
+; Loader: W1K 2026 (AI)
 ;=============================================================================
 
 ; ---- POKEY -----------------------------------------------------------------
@@ -28,51 +32,113 @@ SERIN   = $D20D                 ; prijaty bajt
 IRQEN   = $D20E                 ; povolenie IRQ (zapis)
 IRQST   = $D20E                 ; stav IRQ (citanie, aktivne v nule)
 SKCTL   = $D20F
+SKSTAT  = $D20F                 ; stav seriovej linky a klavesnice (citanie)
 
 ; ---- ostatny HW ------------------------------------------------------------
 DMACTL  = $D400                 ; riadenie DMA
 DLISTL  = $D402                 ; adresa display listu
 DLISTH  = $D403
 CHBASE  = $D409                 ; sada znakov
-COLPF1  = $D017                 ; jas textu
-COLPF2  = $D018                 ; pozadie textu
+COLPM0  = $D012                 ; COLPM0-3, COLPF0-3, COLBK: 9 registrov za sebou
 COLBK   = $D01A                 ; okraj (indikacia chyby)
+PRIOR   = $D01B
 PACTL   = $D302                 ; motor kazety: $34 = zapnuty, $3C = vypnuty
-PORTB   = $D301                 ; bit 0 = ROM OS, bit 1 = BASIC,
-                                ; bity 2,3,5,6,7 = prepinanie rozsirenych bank
+PORTB   = $D301                 ; bit 0 = ROM OS, bit 1 = BASIC (1 = vypnute)
 NMIEN   = $D40E
+VCOUNT  = $D40B                 ; riadok obrazu / 2 (meni sa kazdych 128 us)
 
 ; ---- OS premenne -----------------------------------------------------------
+CASINI  = $0002                 ; init vektor bootovacieho obrazu
+RAMLO   = $0004                 ; OS: adresa zavadzaca (load+6) pri boote
+DOSVEC  = $000A
 POKMSK  = $0010                 ; tienovy register IRQEN
+DFLAGS  = $0240                 ; boot hlavicka: priznaky, pocet zaznamov, load
+DBSECT  = $0241
+BOOTAD  = $0242
+SDMCTL  = $022F                 ; tiene, ktore OS VBI kopiruje do hardveru:
+SDLSTL  = $0230                 ; display list
+SDLSTH  = $0231
+GPRIOR  = $026F
+PCOLR0  = $02C0                 ; PCOLR0-3, COLOR0-4 (9 bajtov za sebou)
+COLOR1  = $02C5
+COLOR2  = $02C6
 RUNAD   = $02E0                 ; adresa spustenia programu
 INITAD  = $02E2                 ; adresa inicializacie segmentu
+CHBAS   = $02F4
 
 ; ---- nulta stranka (volne bajty $CB-$D1 na XL/XE) --------------------------
-DSTPTR  = $CB                   ; cielovy ukazovatel segmentu (2 B)
-SEGLEN  = $CD                   ; zostavajuca dlzka segmentu (2 B)
-SEGEND  = $CF                   ; koncova adresa segmentu (2 B)
+; Zapisy programu do nultej stranky idu do tiena ZPSHAD, takze tieto bajty
+; segment neprepise; skutocna nulta stranka dostane tien pred INIT a RUN.
+WPTR    = $CB                   ; ukazovatel zapisu (nizky bajt vzdy 0)
+DPAGE   = $CD                   ; stranka ciela segmentu
+SEGCNT  = $CE                   ; -(zostavajuca dlzka segmentu), ide hore k 0
+DSTY    = $D0                   ; nizky bajt ciela medzi behmi kopirovania
+SUM     = $D1                   ; kontrolny sucet prijimaneho bloku
+QSRC    = $CB                   ; stub: zdroj behu qrosos (2 B)
+QDST    = $CD                   ; stub: ciel behu (2 B)
+QLEN    = $CF                   ; stub: dlzka behu
+
+; ---- RAM pod OS ROM (loader v kopii FP ROM $D800-$DFFF) --------------------
+LOADER_LO = $D8                 ; stranky loadera: chranene pred zapisom
+LOADER_HI = $E0                 ; (prva stranka za nimi)
+VARS    = $D800                 ; premenne a riadok obrazovky (mimo blobu)
+BUFADR  = VARS_END              ; 132-bajtovy blok hned za premennymi
+CDATA_ADR = BUFADR+132          ; konstantne data (texty, tabulky) za blokom
+ZPSHAD  = $D900                 ; tien nultej stranky (cela stranka)
+MAIN_ADR = $DA00                ; hlavny kod loadera, po stranky do $DFFF
+TRAMP_ADR = $0100                ; trampolina na dne stranky zasobnika
+
+;---- premenne (v RAM pod ROM, nie su v blobe) ------------------------------
+exp_lo     = VARS+0             ; ocakavany index dalsieho bloku
+tmo        = VARS+1             ; kolko zmien VCOUNT este cakat na bajt
+vtick      = VARS+2             ; posledna videna hodnota VCOUNT
+retries    = VARS+3
+zvars      = VARS+4             ; --- nulovane pri starte ---
+bufpos     = zvars+0            ; pozicia v datovej casti bloku
+bufcnt     = zvars+1            ; pocet platnych bajtov v bloku
+exp_hi     = zvars+2
+collide    = zvars+3            ; program sa pokusil prepisat loader
+name_shown = zvars+4
+pct        = zvars+5
+acc        = zvars+6            ; akumulator percent (2 B)
+baudidx    = zvars+8            ; offset skusanej rychlosti v baudtab (0..6)
+baudtab    = zvars+9            ; styri skusane POKEY delice (8 B)
+cdig       = zvars+17           ; desiatkove pocitadlo nacitanych blokov (4 B)
+totblk     = zvars+21           ; pocet blokov pasky z konca blobu (2 B)
+dl_last    = zvars+23           ; naposledy zapisany display list (2 B)
+dm_last    = zvars+25           ; a DMACTL - ANTIC berie zapis hned, aj uprostred
+bootimg    = zvars+26           ; snimky, preto len pri zmene tienov
+gapcur     = zvars+27           ; bootimg != 0: nahrava sa bootovaci obraz
+gapnext    = zvars+28           ; gapcur/gapnext: tento/dalsi blok zacal po medzere
+zvars_end  = zvars+29
+scrline    = zvars_end          ; textovy riadok (40 B)
+VARS_END   = scrline+40
 
 ; ---- parametre z prikazoveho riadku (-d:) ----------------------------------
 ; BOOT    = 1 -> bootovaci blob pre pasku, 0 -> samostatny XEX
-; LOADADR = adresa kodu loadera
-; BUFADR  = adresa 132-bajtoveho bloku
+; LOADADR = adresa nahrania blobu (po starte patri programu)
 ; DIVISOR = POKEY delic:  baud = takt / (2 * (DIVISOR + 7))
 ;           127 -> 6617 baud PAL (rezim "6600"),  86 -> 9535 baud PAL
 
 POKEY_AUDF_6600 = 127           ; delic pre rezim 6600 (6617 baud PAL)
 POKEY_AUDF_9600 = 86            ; delic pre rezim 9600 (9535 baud PAL)
 
+; Casove limity sa meraju zmenami VCOUNT (128 us), nie cyklami CPU, takze
+; platia aj na akceleratore. Uprostred bloku idu bajty tesne za sebou; ticho
+; dlhsie nez TMO_SHORT je medzera medzi blokmi (IRG) - na nej sa prijem
+; znova zarovna na zaciatok bloku.
+TMO_SHORT = 40                  ; 5,1 ms = ~3,4 bajtu pri 6600 baud
+TMO_LONG  = 176                 ; x 256 zmien = 5,8 s pre prvy bajt bloku
+
 NAMECOL = 0                     ; stlpec nazvu programu na 1. riadku
 PCTCOL  = 36                    ; stlpec percent
+CNTCOL  = PCTCOL-5              ; text "BLOK" pred pocitadlom (bez total_blk)
 
 ; Chybove farby pozadia
-ERR_SYNC  = $34                 ; cervena  - na paske nie je platny XEX
+ERR_SYNC  = $34                 ; cervena  - data nie su v binarnom (DOS) formate
 ERR_BLOCK = $24                 ; oranzova - blok sa neda precitat / chyba
 ERR_NORUN = $B4                 ; zelena   - chyba RUN adresa ($02E0)
 ERR_COLL  = $84                 ; modra    - program prepisuje loader
-
-; Prva stranka za loaderom - koniec chranenej oblasti BUFADR .. bin_end-1
-PROT_END = [[bin_end - 1] / 256] + 1
 
     .if BOOT = 0
     opt h+
@@ -89,88 +155,333 @@ PROT_END = [[bin_end - 1] / 256] + 1
 ; V XEX zostaveni je neskodna - len sa nahra do pamate.
 ;=============================================================================
     dta $00                                 ; priznaky
-    dta [[bin_end - LOADADR + 127] / 128]   ; pocet 128-bajtovych zaznamov
+    dta [[blob_end - LOADADR + 127] / 128]  ; pocet 128-bajtovych zaznamov
     dta a(LOADADR)                          ; adresa nahrania
-    dta a(stub_rts)                         ; init vektor -> CASINI
+    dta a(boot_rts)                         ; init vektor -> CASINI
 
 ;=============================================================================
-; Vstupny bod (LOADADR + 6)
+; Stub (LOADADR + 6): skopiruje OS ROM do RAM, presunie loader pod ROM a
+; pripravi trampolinu. Bezi raz, potom jeho pamat patri programu.
 ;=============================================================================
 entry:
     sei
     cld
     ldx #$FF
     txs
+    inx                         ; X = 0
+    stx NMIEN                   ; ziadne DLI/VBI
+    stx DMACTL                  ; obraz von pocas kopirovania
 
+    lda PORTB                   ; bez BASICu; bit 0: ROM zapnuta / vypnuta
+    ora #$03                    ; (do predlohy trampoliny, kopiruje sa az potom)
+    sta cr_on+1
+    sta tramp_load+[tramp.fr_on+1-TRAMP_ADR]
+    and #$FE
+    sta cr_off+1
+    sta tramp_load+[tramp.fr_off+1-TRAMP_ADR]
+
+    lda #$C0                    ; OS ROM -> RAM: $C000-$CFFF a $E000-$FFFF
+    ldx #$D0                    ; ($D800-$DFFF obnovi trampolina pred startom)
+    jsr copy_rom
+    lda #$E0
+    ldx #0
+    jsr copy_rom
+
+; QROS OS: upravy kopie OS (qrosos.inc) - behy
+; [adresa, dlzka, bajty...], koniec dlzka 0. ROM je vypnuta.
+    lda #<qrosos
+    sta QSRC
+    lda #>qrosos
+    sta QSRC+1
+qr_next:
+    ldy #2
+    lda (QSRC),y                ; dlzka behu (1..255); 0 = koniec
+    beq qr_done
+    sta QLEN
+    dey
+    lda (QSRC),y                ; adresa (aj nulta stranka)
+    sta QDST+1
+    dey
+    lda (QSRC),y
+    sta QDST
+    lda #3                      ; QSRC += 3 (hlavicka behu)
+    jsr qr_adv
+    ldx QLEN
+    ldy #0
+qr_copy:
+    lda (QSRC),y
+    sta (QDST),y
+    iny
+    dex
+    bne qr_copy
+    lda QLEN                    ; QSRC += dlzka behu
+    jsr qr_adv
+    jmp qr_next
+qr_adv:
+    clc
+    adc QSRC
+    sta QSRC
+    bcc qa_ret
+    inc QSRC+1
+qa_ret:
+    rts
+qr_done:
+    jsr QROSOS_INIT             ; inicializacia QROS handlera (CIN v kopii OS)
+
+    ldx #0
+    ldy #>[MAIN_LEN+255]        ; hlavny kod na MAIN, po celych strankach
+mv_loop:
+mv_src:
+    lda main_load,x
+mv_dst:
+    sta MAIN_ADR,x
+    inx
+    bne mv_loop
+    inc mv_src+2
+    inc mv_dst+2
+    dey
+    bne mv_loop
+
+zs_loop:                        ; tien nultej stranky = jej sucasny stav
+    lda $00,x
+    sta ZPSHAD,x
+    inx
+    bne zs_loop
+
+    ldx #tramp_len-1            ; trampolina do stranky $01
+tr_copy:
+    lda tramp_load,x
+    sta TRAMP_ADR,x
+    dex
+    bpl tr_copy
+
+    ldx #cdata_len-1            ; konstantne data pod ROM
+cd_copy:
+    lda cdata_load,x
+    sta CDATA_ADR,x
+    dex
+    bpl cd_copy
+
+    jmp main.start
+
+; copy_rom - stranky A az X-1 (X = 0: po $FFFF) z OS ROM do RAM pod nou.
+; Pod ROM sa zapisuje len pri vypnutej ROM, preto sa PORTB prepina po bajte.
+; Konci s vypnutou ROM.  Nici: A, X, Y
+copy_rom:
+    sta cr_src+2
+    sta cr_dst+2
+    stx cr_end+1
+    ldx #0
+cr_off:
+    ldy #0                      ; SMC: PORTB bez ROM (v Y pocas celej kopie)
+cr_loop:
+cr_on:
+    lda #0                      ; SMC: PORTB s ROM
+    sta PORTB
+cr_src:
+    lda $FF00,x
+    sty PORTB
+cr_dst:
+    sta $FF00,x
+    inx
+    bne cr_loop
+    inc cr_src+2
+    inc cr_dst+2
+    lda cr_dst+2
+cr_end:
+    cmp #0                      ; SMC: koncova stranka
+    bne cr_loop
+boot_rts:
+    rts
+
+;=============================================================================
+; Trampolina (stranka $01): kod, ktory bezi mimo loadera.
+;=============================================================================
+tramp_load:
+    .local tramp, TRAMP_ADR
+
+; init - INIT segmentu bezi ako pod DOS (VBI aj IRQ, bez serioveho prijmu),
+; ale uz s vypnutou ROM: vidi QROS OS v RAM.
+init:
+    jsr irq_on
+    jsr call_init
+    sei
     lda #0
-    sta NMIEN                   ; ziadne DLI/VBI pocas prenosu
+    sta NMIEN
+    rts
+call_init:
+    jmp (INITAD)
 
-; --- POKEY: asynchronny seriovy prijem --------------------------------------
-    lda #$28                    ; kanaly 3+4 spojene, kanal 3 na 1.79 MHz
-    sta AUDCTL
-    lda #$A0                    ; ciste tony, hlasitost 0
-    sta AUDC3
-    sta AUDC4
-    lda baudiv                  ; prva skusana rychlost (dopisatelna)
-    sta baudtab
-    lda baudiv+1
-    sta baudtab+1
-    lda baudiv                  ; druha je ta zvysna bezna QROS rychlost
-    cmp #POKEY_AUDF_9600
-    bne bi_alt_9600
-    lda #POKEY_AUDF_6600
-    bne bi_alt_store
-bi_alt_9600:
-    lda #POKEY_AUDF_9600
-bi_alt_store:
-    sta baudtab+2
+; boot_go - bootovaci obraz (RUNAD ukazuje sem): ako OS po nahrani z kazety
+boot_go:
+    jsr call_boot               ; zavadzac na load+6, vracia sa cez rts
+    jsr call_casini
+    jmp (DOSVEC)
+call_boot:
+    jmp (RAMLO)
+call_casini:
+    jmp (CASINI)
+
+; run - obnovi FP ROM $D800-$DFFF (prepise loader), zapne prerusenia cez
+; vektory kopie OS a spusti program s vypnutou ROM.
+run:
+    ldx #0
+fr_off:
+    ldy #0                      ; SMC: PORTB bez ROM (v Y, takto ostane)
+fr_loop:
+fr_on:
+    lda #0                      ; SMC: PORTB s ROM
+    sta PORTB
+fr_src:
+    lda $D800,x
+    sty PORTB
+fr_dst:
+    sta $D800,x
+    inx
+    bne fr_loop
+    inc fr_src+2
+    inc fr_dst+2
+    lda fr_dst+2
+    cmp #LOADER_HI
+    bne fr_loop
+    jsr irq_on
+    jmp (RUNAD)
+
+irq_on:                         ; obvykle IRQ (BREAK + klavesnica) a VBI
+    lda #$C0
+    sta POKMSK
+    sta IRQEN
+    lda #$40
+    sta NMIEN
+    cli
+    rts
+
+    .endl
+tramp_len = * - tramp_load
+    ert tramp_len > 96
+
+;=============================================================================
+; Konstantne data pod ROM (stub ich skopiruje na CDATA): texty a tabulky chyb
+;=============================================================================
+cdata_load:
+    .local cdata, CDATA_ADR
+label_txt   dta d'QROS LOADER V2, W1K 2026 (AI)'
+label_end
+cnt_txt     dta d'BLOK'
+cnt_end
+err_col     dta ERR_SYNC, ERR_BLOCK, ERR_NORUN, ERR_COLL
+err_msg     dta main.msg_sync-main.msgs, main.msg_block-main.msgs
+            dta main.msg_norun-main.msgs, main.msg_coll-main.msgs
+    .endl
+cdata_len = * - cdata_load
+    ert cdata_len > 128
+    ert CDATA_ADR + cdata_len > ZPSHAD              ; data sa zmestia pred tien
+
+;=============================================================================
+; Hlavny kod loadera - bezi na MAIN pod OS ROM
+;=============================================================================
+main_load:
+    .local main, MAIN_ADR
+
+;=============================================================================
+; Chyby - pred vstupom (start sa vola cez jmp), v dosahu kratkych vetvi
+; parsera (vstupy su tesne pred start). Kazdy ldx preskoci dalsie cez
+; bit abs ($2C).
+;=============================================================================
+; halt - X = cislo chyby: text za "CHYBA - " a farba okraja
+halt:                           ; I=1 vzdy (entry, tramp.init konci sei)
+    txa
+    pha
+    jsr motor_off
+    jsr scr_on                  ; nas riadok na obrazovke, NMI von
+    jsr clr_line                ; konci s A = 0
+    tax                         ; X = stlpec 0
+    tay                         ; Y = text "CHYBA - " (msg_pre = msgs)
+    jsr hl_copy
+    pla
+    tay
+    lda cdata.err_col,y
+    pha
+    lda cdata.err_msg,y
+    tay
+    jsr hl_copy
+    pla
+halt_loop:
+    sta COLBK
+    jmp halt_loop
+
+hl_copy:                        ; text od msgs+Y po $FF na stlpec X
+    lda msgs,y
+    bmi hl_ret
+    sta scrline,x
+    inx
+    iny
+    bne hl_copy
+hl_ret:
+    rts
+
+no_run:
+    ldx #2
+    dta $2C
+e_sync:
+    ldx #0
+    dta $2C
+e_block:
+    ldx #1
+    dta $2C
+e_coll:
+    ldx #3
+    jmp halt
+
+start:
     lda #0
-    sta baudtab+3
-    sta baudidx
-
-    jsr set_baud                ; delic, SKCTL, SKRES aj IRQEN naraz
-                                ; (druhy zapis IRQEN by zahodil prijimany bajt)
-
-; --- motor kazety zapnut ----------------------------------------------------
-    lda #$34
-    sta PACTL
-
-; --- vynulovanie stavu ------------------------------------------------------
-    lda #0
-    sta bufpos
-    sta bufcnt
-    sta collide
-    sta exp_hi
-    sta name_shown
-    sta pct
-    sta acc
-    sta acc+1
-    lda #2                      ; datove bloky zacinaju indexom 2
-    sta exp_lo
-
-    lda total_blk               ; ak pozname celu pasku, percenta su globalne
-    sta pgtot
-    lda total_blk+1
-    sta pgtot+1
-
-    lda #<stub_rts              ; INITAD na neutralne RTS
-    sta INITAD
-    lda #>stub_rts
-    sta INITAD+1
-    lda #<no_run                ; RUNAD na hlasenie "chyba RUN"
-    sta RUNAD
-    lda #>no_run
+    sta WPTR
+    ldx #zvars_end - zvars      ; vynulovanie stavu
+clr_vars:
+    sta zvars-1,x
+    dex
+    bne clr_vars
+    sta INITAD+1                ; vysoky bajt 0 = INIT/RUN nenastaveny
     sta RUNAD+1
 
+; Skusane delice: zadany, o 4 mensi, druha bezna QROS rychlost, o 4 mensia.
+; Zaznam z emulatora ma presnu rychlost delica a jeho dekoder vzorkuje bity
+; neskoro - precita ho az prijimac o ~3 % rychlejsi. Realna paska ide hned
+; prvym. Delice su 8-bitove, vysoke bajty ostavaju 0.
+    lda baudiv
+    sta baudtab
+    ldx #POKEY_AUDF_6600
+    cmp #POKEY_AUDF_9600
+    beq bi_alt
+    ldx #POKEY_AUDF_9600
+bi_alt:
+    stx baudtab+4
+    sec
+    sbc #4
+    sta baudtab+2
+    txa                         ; C=1: delice > 4, sbc nepozicia
+    sbc #4
+    sta baudtab+6
+
+    lda #2                      ; datove bloky zacinaju indexom 2
+    sta exp_lo
+    lda total_blk               ; parametre z konca blobu - blob program prepise
+    sta totblk
+    lda total_blk+1
+    sta totblk+1
+
+    jsr motor_off               ; motor stal uz po boote OS - cakame na klavesu
     jsr screen_init
+    jsr wait_key
+    jsr ser_init                ; POKEY prijem + motor
 
 ;=============================================================================
 ; Parser Atari binarneho formatu (streamovany priamo z pasky)
 ;=============================================================================
-    jsr getbyte                 ; povinna hlavicka FF FF
+    jsr getbyte                 ; FF FF = binarny format, inak bootovaci obraz
     jcs e_sync
     cmp #$FF
-    jne e_sync
+    jne boot_img
     jsr getbyte
     jcs e_sync
     cmp #$FF
@@ -179,201 +490,260 @@ bi_alt_store:
 seg_loop:
     jsr getbyte                 ; zaciatocna adresa segmentu
     jcs load_done               ; korektny koniec medzi segmentmi
-    sta DSTPTR
+    sta DSTY
     jsr getbyte
     jcs e_sync
-    sta DSTPTR+1
+    sta DPAGE
 
-    and DSTPTR                  ; $FFFF = dalsia (volitelna) FF FF hlavicka
+    and DSTY                    ; $FFFF = dalsia (volitelna) FF FF hlavicka
     cmp #$FF
     beq seg_loop
 
-    jsr getbyte                 ; koncova adresa segmentu
-    jcs e_sync
-    sta SEGEND
+    jsr getbyte                 ; koncova adresa segmentu (docasne v SEGCNT)
+    jcs far_sync                ; (e_sync uz mimo dosahu, far_sync hned za nami)
+    sta SEGCNT
     jsr getbyte
-    jcs e_sync
-    sta SEGEND+1
+    jcs far_sync
+    sta SEGCNT+1
 
-    sec                         ; SEGLEN = end - start + 1
-    lda SEGEND
-    sbc DSTPTR
-    sta SEGLEN
-    lda SEGEND+1
-    sbc DSTPTR+1
-    sta SEGLEN+1
-    jcc e_sync                  ; end < start -> poskodeny subor
-    inc SEGLEN
-    bne seg_ready
-    inc SEGLEN+1
-seg_ready:
-    jsr setup_progress          ; percenta pocitame z dlzky segmentu
+    lda DSTY                    ; SEGCNT = start - end - 1 = -dlzka
+    sbc SEGCNT                  ; C=0 z getbyte odcita tu jednotku
+    sta SEGCNT
+    lda DPAGE
+    sbc SEGCNT+1
+    sta SEGCNT+1
+    bcc seg_ok                  ; start > end -> poskodeny subor
+far_sync:
+    jmp e_sync                  ; aj pre dalsie vetvy mimo dosahu e_sync
+cl_eof:                         ; koniec pasky uprostred segmentu je chyba; pri
+    lda bootimg                 ; boot obraze moze byt posledny zaznam kratsi,
+    jeq far_sync                ; nez hovori hlavicka - OS bootu to nevadi
+    jmp load_done
+seg_ok:
 
-copy_loop:
-    lda SEGLEN                  ; hotovo, ked SEGLEN = 0
-    ora SEGLEN+1
-    beq seg_done
 
-    jsr getbyte
-    jcs e_sync                  ; koniec pasky uprostred segmentu
+;-----------------------------------------------------------------------------
+; Kopirovanie segmentu po behoch: beh = zvysok bloku alebo zvysok segmentu,
+; co je kratsie. V behu ide X hore k nule (zdroj, operand lda je posunuty),
+; Y je nizky bajt ciela, WPTR+1 stranka zapisu podla cl_chk.
+; Vstup: DPAGE:DSTY = ciel, SEGCNT = -dlzka (aj z boot_img).
+;-----------------------------------------------------------------------------
+copy_seg:
+    jsr cl_chk                  ; zapis podla prvej stranky
+    bcc cl_run
+    sta collide                 ; A != 0: do chranenej stranky ide bajt
+cl_run:
+    lda bufcnt                  ; A = zvysok bloku (bufpos <= bufcnt)
+    sec
+    sbc bufpos
+    bne cl_avail
+    jsr next_block              ; blok minuty -> dalsi (bufcnt 1..128)
+    bcs cl_eof                  ; koniec pasky uprostred segmentu
+    lda #0
+    sta bufpos
+    lda bufcnt
+cl_avail:                       ; A = zvysok bloku (1..128)
+    ldx SEGCNT+1                ; zvysok segmentu >= 256 -> cely zvysok bloku
+    inx
+    bne cl_take
+    tax
+    clc
+    adc SEGCNT                  ; C=1: zvysok bloku >= zvysok segmentu (-SEGCNT)
+    txa
+    bcc cl_take
+    lda #0                      ; beh = -SEGCNT (C=1 z adc)
+    sbc SEGCNT
+cl_take:                        ; A = dlzka behu
+    tay
+    eor #$FF                    ; X = -beh, ide hore k nule
+    tax
+    inx
+    tya
+    clc
+    adc SEGCNT                  ; SEGCNT += beh
+    sta SEGCNT
+    bcc cl_lim
+    inc SEGCNT+1
+    clc
+cl_lim:                         ; C=0
+    tya
+    adc bufpos                  ; koniec behu = nova pozicia v bufri (<= 128)
+    sta bufpos
+    adc #<[BUFADR+3-256]        ; C=0; lda base,x s X = -beh..-1
+    sta cl_ld+1
+    lda #>[BUFADR+3-256]
+    adc #0
+    sta cl_ld+2
+    ldy DSTY
 
-    ldx DSTPTR+1                ; nesmieme prepisat sameho seba
-    cpx #>BUFADR                ; pod chranenou oblastou -> zapis
-    bcc store_ok
-    cpx #PROT_END               ; nad nou -> tiez zapis
-    bcc protected
-store_ok:
-    ldy #0
-    sta (DSTPTR),y
-    jmp advance
-protected:
-    inc collide
+; Cely blok (koniec behu 128) cita data bloku bez prechodu stranky:
+; 19 cyklov na bajt, kratsi beh 20.
+cl_ld:
+    lda a:$0000,x               ; SMC: BUFADR+3 + koniec behu - 256
+cl_st:
+    sta (WPTR),y                ; SMC: bit WPTR, ak sa do stranky nezapisuje
+    iny
+    beq cl_page                 ; raz za 256 bajtov, mimo slucky
+cl_inx:
+    inx
+    bne cl_ld
+    ert >cl_ld <> >*            ; slucka v jednej stranke
 
-advance:
-    inc DSTPTR
-    bne dec_len
-    inc DSTPTR+1
-dec_len:
-    lda SEGLEN
-    bne dec_lo
-    dec SEGLEN+1
-dec_lo:
-    dec SEGLEN
-    jmp copy_loop
+    sty DSTY
+    lda SEGCNT
+    ora SEGCNT+1
+    bne cl_run                  ; segment pokracuje v dalsom bloku
 
 ;-----------------------------------------------------------------------------
 ; Segment nacitany - ak sa zmenil INITAD, zavolame ho (rovnako ako DOS)
 ;-----------------------------------------------------------------------------
-seg_done:
-    lda INITAD
-    cmp #<stub_rts
-    bne do_init
-    lda INITAD+1
-    cmp #>stub_rts
+    lda INITAD+1                ; segment nastavil INIT? (0 = nie)
     jeq seg_loop
 
 do_init:
-    jsr call_init
-    lda #<stub_rts
-    sta INITAD
-    lda #>stub_rts
+    jsr zp_put                  ; INIT vidi nultu stranku programu
+    jsr tramp.init
+    jsr zp_get                  ; co v nej INIT zmenil, ostava v tieni
+    lda #0
     sta INITAD+1
+    sta WPTR                    ; INIT (alebo tien) mohol prepisat nas ZP
+    jsr scr_sync                ; obraz podla tienov (INIT ich mohol zmenit)
+    jsr ser_init                ; INIT mohol zmenit POKEY aj motor
     jmp seg_loop
 
-call_init:
-    jmp (INITAD)
-stub_rts:
+; --- zriedkave vetvy kopirovania --------------------------------------------
+cl_page:
+    inc DPAGE
+    jsr cl_chk
+    ldy #0
+    bcc cl_inx                  ; zapisovatelna stranka alebo hardver
+    cpx #$FF                    ; pojde do nej este bajt? (tento beh alebo dalsi)
+    bne cl_hit
+    lda SEGCNT
+    ora SEGCNT+1
+    beq cl_inx
+cl_hit:
+    sta collide                 ; A != 0
+    jmp cl_inx
+
+;-----------------------------------------------------------------------------
+; Bootovaci obraz (ako OS boot z kazety): hlavicka = priznaky,
+; pocet 128-bajtovych zaznamov, load, init. Cely obraz aj s hlavickou ide na
+; load - jej bajty su este v bufri, bufpos sa vrati na 0. Spusta ho
+; tramp.boot_go cez RAMLO (load+6) a CASINI (v tieni nultej stranky).
+;-----------------------------------------------------------------------------
+bi_sync:
+    jmp e_sync                  ; chyby hlavicky (e_sync mimo dosahu vetvi)
+boot_img:
+    sta DFLAGS
+    jsr getbyte                 ; pocet zaznamov -> SEGCNT = -(zaznamy * 128)
+    bcs bi_sync
+    sta DBSECT
+    beq bi_sync                 ; 0 zaznamov nie je obraz
+    sta bootimg
+    lsr                         ; cele stranky, C = +128 B
+    eor #$FF                    ; A = -stranky - 1
+    tax
+    lda #$80
+    bcs bi_cnt
+    inx                         ; parny pocet: -stranky, 0 B navyse
+    lda #0
+bi_cnt:
+    sta SEGCNT
+    stx SEGCNT+1
+    jsr getbyte                 ; load
+    bcs bi_sync
+    sta DSTY
+    sta BOOTAD
+    jsr getbyte
+    bcs bi_sync
+    sta DPAGE
+    sta BOOTAD+1
+    jsr getbyte                 ; init -> CASINI
+    bcs bi_sync
+    sta ZPSHAD+CASINI
+    jsr getbyte
+    bcs bi_sync
+    sta ZPSHAD+CASINI+1
+    lda DSTY                    ; RAMLO = load + 6; C=0 z getbyte (bcs nevykonane)
+    adc #6
+    sta ZPSHAD+RAMLO
+    lda DPAGE
+    adc #0
+    sta ZPSHAD+RAMLO+1
+    lda #<tramp.boot_go
+    sta RUNAD
+    lda #>tramp.boot_go
+    sta RUNAD+1
+    lda #0                      ; hlavicka je sucast obrazu
+    sta bufpos
+    jmp copy_seg
+
+; cl_chk - zapis v slucke podla stranky DPAGE: $00 -> tien ZPSHAD, $01 a
+; stranky loadera -> chranene (zahodit, kolizia), $D0-$D7 hardver (zahodit),
+; vsetko ostatne priamo (aj kopia OS pod ROM).
+; Vystup: C=1 chranena (A != 0).  Nici: A
+cl_chk:
+    lda DPAGE
+    beq ck_zp
+    cmp #1
+    beq ck_drop                 ; stranka zasobnika; C=1 z cmp
+    cmp #$D0
+    bcc ck_free                 ; RAM pod $D000
+    cmp #LOADER_HI
+    bcs ck_free                 ; kopia OS za loaderom
+    cmp #LOADER_LO              ; C=1 loader ($D8-$DF), C=0 hardver ($D0-$D7)
+ck_drop:
+    lda #$24                    ; bit zp: zapis sa zahodi (A != 0 pre collide)
+    sta cl_st
+    rts
+ck_zp:
+    lda #>ZPSHAD
+ck_free:
+    sta WPTR+1
+    lda #$91                    ; sta (zp),y
+    sta cl_st
+    clc
+    rts
+
+; zp_put / zp_get - tien nultej stranky do nej / z nej.  Nici: A, X
+zp_put:
+    ldx #0
+zpp_loop:
+    lda ZPSHAD,x
+    sta $00,x
+    inx
+    bne zpp_loop
+    rts
+
+zp_get:
+    ldx #0
+zpg_loop:
+    lda $00,x
+    sta ZPSHAD,x
+    inx
+    bne zpg_loop
     rts
 
 ;=============================================================================
-; Koniec nahravania - motor stop, obnovenie prostredia, spustenie programu
+; Koniec nahravania - motor stop, nulta stranka a PORTB programu, spustenie
 ;=============================================================================
 load_done:
-    lda #100                    ; dokoncene
-    sta pct
-    jsr show_progress
-
-    lda #$3C                    ; motor vypnut
-    sta PACTL
-    lda #0
-    sta AUDC3
-    sta AUDC4
-
+    jsr motor_off
     lda collide
     jne e_coll
-
-; Program mohol pocas nahravania prepnut PORTB (rozsirena pamat, vypnuta ROM
-; OS). Prerusenia zapneme len ak je ROM OS este na mieste - inak by vektory
-; na $FFFA/$FFFE ukazovali do RAM a stroj by spadol.
-    lda PORTB
-    and #$01
-    beq ld_no_irq
-
-    lda #$C0                    ; obvykle IRQ (BREAK + klavesnica)
-    sta POKMSK
-    sta IRQEN
-    lda #$40                    ; VBI spat
-    sta NMIEN
-    cli
-
-ld_no_irq:
-    jmp (RUNAD)
-
-no_run:
-    ldx #2
-    lda #ERR_NORUN
-    jmp halt
-
-e_sync:
-    ldx #0
-    lda #ERR_SYNC
-    jmp halt
-
-e_block:
-    ldx #1
-    lda #ERR_BLOCK
-    jmp halt
-
-e_coll:
-    ldx #3
-    lda #ERR_COLL
-
-; halt - X = index chyboveho textu, A = farba okraja
-halt:
-    sta halt_col
-    stx halt_idx
-
-    lda #$3C                    ; motor vypnut
-    sta PACTL
-    lda #0
-    sta AUDC3
-    sta AUDC4
-
-    lda scr_ok                  ; vypiseme text chyby na nas riadok
-    beq halt_loop
-    ldy #39
-    lda #0
-hl_clear:
-    sta scrline,y
-    dey
-    bpl hl_clear
-
-    ldx halt_idx
-    lda msg_lo,x
-    sta hl_load+1
-    lda msg_hi,x
-    sta hl_load+2
-    ldy #0
-hl_copy:
-hl_load:
-    lda a:$0000,y
-    beq halt_loop
-    sty hl_y
-    jsr a2s                     ; texty su v ATASCII
-    ldy hl_y
-    sta scrline,y
-    iny
-    cpy #40
-    bne hl_copy
-
-halt_loop:
-    lda halt_col
-    sta COLBK
-    jmp halt_loop
-
-; --- chybove texty (ATASCII, ukoncene nulou) --------------------------------
-msg_lo  dta <msg_sync, <msg_block, <msg_norun, <msg_coll
-msg_hi  dta >msg_sync, >msg_block, >msg_norun, >msg_coll
-
-msg_sync    dta c'CHYBA - NA PASKE NIE JE XEX', 0
-msg_block   dta c'CHYBA - NECITATELNY BLOK', 0
-msg_norun   dta c'CHYBA - CHYBA RUN ADRESA', 0
-msg_coll    dta c'CHYBA - PROGRAM PREPISUJE LOADER', 0
+    lda RUNAD+1                 ; RUN musi byt nastaveny (0 = nie)
+    jeq no_run
+    lda #0                      ; obraz von: nas riadok a display list zmiznu
+    sta SDMCTL                  ; s obnovou FP ROM, program si obraz zapne sam
+    jsr scr_sync
+    jsr zp_put
+    jmp tramp.run
 
 ;=============================================================================
-; getbyte - dalsi datovy bajt XEX prudu
+; getbyte - dalsi datovy bajt XEX prudu (hlavicky segmentov)
 ; Vystup: A = bajt, C=0.  C=1 = koniec suboru (EOF blok).
-; Nici: X
+; Nici: X, Y
 ;=============================================================================
 getbyte:
     ldx bufpos
@@ -381,22 +751,19 @@ getbyte:
     bcc gb_have
 
     jsr next_block
-    bcs gb_eof
-    ldx bufpos
+    bcs gb_ret
+    ldx #0
 
-gb_have:
+gb_have:                        ; C=0: z bcc aj z nevykonaneho bcs
     lda BUFADR+3,x
-    inc bufpos
-    clc
-    rts
-
-gb_eof:
-    sec
+    inx
+    stx bufpos
+gb_ret:
     rts
 
 ;=============================================================================
 ; next_block - nacita dalsi POUZITELNY datovy blok do buffra
-; Vystup: C=0 blok pripraveny (bufpos=0, bufcnt=pocet platnych bajtov)
+; Vystup: C=0 blok pripraveny (bufcnt = 1..128 platnych bajtov)
 ;         C=1 nacitany koncovy blok
 ;=============================================================================
 next_block:
@@ -407,23 +774,27 @@ nb_next:
     jsr read_block
     bcs nb_bad                  ; timeout alebo zly kontrolny sucet
 
-    lda BUFADR+2
-    cmp #$FE
-    beq nb_eof
+    lda BUFADR+2                ; typ bloku
     cmp #$FC
-    beq nb_index
+    beq nb_data
     cmp #$FA
-    beq nb_index
+    beq nb_data
     cmp #$FD
     beq nb_header
     cmp #$FF
     beq nb_next                 ; nastavovaci blok len preskocime
+    cmp #$FE
+    bne nb_skip
+    rts                         ; koniec suboru, C=1 z cmp
 
-; Blok sa necita alebo mu nerozumieme. Skusime druhu rychlost - takto loader
-; zvladne 6600 aj 9600 pasku bez samostatneho buildu. Pocet pokusov je
-; obmedzeny, aby sa nikdy nezacyklil.
-nb_bad:
+; Blok sa necita: ak zacal po medzere (ciste), je zla rychlost - skusime
+; dalsiu z tabulky. Ak sme don vbehli uprostred, len sa zarovname na dalsiu
+; medzeru. Blok s dobrym suctom, ale zlym typom alebo poradim, preskocime.
+; Pocet pokusov je obmedzeny, aby sa loader nikdy nezacyklil.
+nb_bad:                         ; Z = (gapcur = 0) z read_block (lda pred rts)
+    beq nb_skip
     jsr next_baud
+nb_skip:
     dec retries
     bne nb_next
     jmp e_block
@@ -432,138 +803,203 @@ nb_header:
     jsr show_name               ; hlavicka - vypiseme nazov programu
     jmp nb_next
 
-; --- kontrola poradia bloku -------------------------------------------------
-nb_index:
+; --- kontrola poradia a dlzky bloku (A = typ) -------------------------------
+nb_data:
     ldx BUFADR+1                ; nizky bajt indexu
     cpx exp_lo
-    bne nb_bad
+    bne nb_skip
     ldx BUFADR
     cpx exp_hi
-    bne nb_bad
+    bne nb_skip
 
-    inc exp_lo
-    bne nb_len
-    inc exp_hi
-
-nb_len:
     ldx #128                    ; uplny blok
     cmp #$FC
-    beq nb_store
+    beq nb_ok
     ldx BUFADR+130              ; neuplny blok - pocet platnych v poslednom bajte
+    beq nb_skip
+    cpx #129
+    bcs nb_skip
 
-nb_store:
+nb_ok:
     stx bufcnt
-    lda #0
-    sta bufpos
+    inc exp_lo
+    bne nb_prog
+    inc exp_hi
+nb_prog:
     jsr bump_progress
+    jsr scr_sync                ; tiene -> hardver, ako OS VBI
     clc
-    rts
-
-nb_eof:
-    sec
     rts
 
 ;=============================================================================
 ; read_block - nacita 132 bajtov a overi SIO kontrolny sucet
-; Vystup: C=0 v poriadku, C=1 timeout alebo zly sucet
+; Sucet sa pocita uz pocas prijmu, takze v medzere medzi blokmi ostava viac
+; casu na spracovanie. Kazde zlyhanie konci za medzerou (IRG), takze dalsi
+; pokus zacina presne na zaciatku bloku.
+; Vystup: C=0 v poriadku; C=1 timeout alebo zly sucet, A (a Z) = gapcur:
+;         blok zacal po medzere (ticho >= TMO_SHORT pred prvym bajtom, alebo
+;         medzera najdena v predoslom pokuse), inak sme vbehli do stredu.
 ;=============================================================================
 read_block:
-    ldx #0
-rb_loop:
-    jsr getser                  ; getser zachovava X aj Y
-    bcs rb_fail
-    sta BUFADR,x
-    inx
-    cpx #132
-    bne rb_loop
+    lda gapnext                 ; medzeru nasiel uz predosly pokus?
+    sta gapcur
+    lda #0
+    sta gapnext
+    ldx #TMO_LONG               ; prvy bajt: TMO_LONG x 33 ms
+rb_first:
+    lda #0                      ; 256 tickov
+    jsr sbyte
+    bcc rb_start
+    dex
+    bne rb_first
+    inx                         ; po 5,8 s ticha: dalsi bajt je po medzere
+    stx gapnext
+    txa                         ; A = 1, Z = 0; C = 1 z sbyte
+    rts
 
-    lda #0                      ; sucet s prenosom cez 131 bajtov
-    ldx #0
-rb_sum:
+rb_start:                       ; A = prvy bajt; X = TMO_LONG len ak prisiel hned
+    pha
+    cpx #TMO_LONG
+    bne rb_gap
+    lda tmo                     ; cakali sme 256-tmo tickov; 0 = bajt hned
+    beq rb_sync
+    cmp #257-TMO_SHORT          ; tmo <= 256-TMO_SHORT: cakanie >= TMO_SHORT
+    bcs rb_sync
+rb_gap:
+    lda #1
+    sta gapcur
+rb_sync:
+    lda #0                      ; sucet prvych 131 bajtov
+    sta SUM
+    ldx #256-132                ; index ide hore k nule
+    pla                         ; prvy bajt
     clc
-    adc BUFADR,x
-    adc #0
-    inx
-    cpx #131
-    bne rb_sum
+    bcc rb_store                ; C=0 pre sucet
 
-    cmp BUFADR+131
-    bne rb_fail
+rb_have:                        ; C=0 od adc #0 (cakanie ho nemeni)
+    lda SERIN
+    ldy #0                      ; vynulovanie a znovuzapnutie zapisovaca IRQ
+    sty IRQEN
+    ldy #$20
+    sty IRQEN
+rb_store:
+    sta BUFADR+132-256,x
+    inx
+    beq rb_check                ; A = 132. bajt = kontrolny sucet
+    adc SUM                     ; sucet s prenosom; C=0 (adc #0 neprenasa)
+    adc #0
+    sta SUM
+    lda #TMO_SHORT              ; dalsi bajt musi prist hned (sbyte inline)
+    sta tmo
+rb_wait:
+    lda IRQST                   ; bit 5 v nule = prijaty bajt
+    and #$20
+    beq rb_have
+    lda VCOUNT                  ; eor nemeni C (sucet ho potrebuje 0)
+    eor vtick
+    beq rb_wait
+    eor vtick
+    sta vtick
+    dec tmo
+    bne rb_wait
+    beq rb_dgap                 ; Z=1: medzera uprostred bloku
+
+rb_check:
+    cmp SUM
+    bne rb_drain
     clc
     rts
 
+rb_drain:                       ; zly sucet: zvysok bloku zahodime po medzeru
+    ldx #0                      ; najviac 256 bajtov
+rb_dloop:
+    lda #TMO_SHORT
+    jsr sbyte
+    bcs rb_dgap
+    dex
+    bne rb_dloop
+    beq rb_fail                 ; Z=1: 256 bajtov bez medzery (prud bez pauz)
+rb_dgap:
+    inc gapnext                 ; medzera najdena: dalsi bajt je po nej
 rb_fail:
+    lda gapcur
     sec
     rts
 
 ;=============================================================================
-; set_baud - nastavi POKEY delic podla baudidx a zresetuje seriovu linku
-set_baud:
+; sbyte - prijme jeden bajt z POKEY seriovej linky
+; Vstup: A = najviac kolko zmien VCOUNT cakat (0 = 256, 33 ms)
+; Vystup: A = bajt, C=0.  C=1 = timeout.
+; X zachova (read_block v nom drzi poziciu v bloku), nici Y.
+;=============================================================================
+sbyte:
+    sta tmo
+sb_wait:
+    lda IRQST                   ; bit 5 v nule = prijaty bajt
+    and #$20
+    beq sb_have
+    lda VCOUNT
+    cmp vtick
+    beq sb_wait
+    sta vtick
+    dec tmo
+    bne sb_wait
+    sec
+    rts
+
+sb_have:
+    lda SERIN
+    ldy #0                      ; vynulovanie a znovuzapnutie zapisovaca IRQ
+    sty IRQEN
+    ldy #$20
+    sty IRQEN
+    clc
+    rts
+
+;=============================================================================
+; next_baud - dalsi delic z tabulky (dookola) a pokracuje do ser_init.
+; Hlavicka sa na paske posiela dvakrat a pred nou su medzery, takze sa loader
+; zosynchronizuje este pred prvym datovym blokom.
+; ser_init - POKEY asynchronny prijem rychlostou baudidx, motor zapnut
+; Nici: A, X
+;=============================================================================
+next_baud:
     lda baudidx
-    asl
-    tax
+    clc
+    adc #2
+    and #7                      ; 4 polozky x 2 B
+    sta baudidx
+
+ser_init:
+    lda #$28                    ; kanaly 3+4 spojene, kanal 3 na 1.79 MHz
+    sta AUDCTL
+    lda #$A0                    ; ciste tony, hlasitost 0
+    sta AUDC3
+    sta AUDC4
+    ldx baudidx                 ; 0..6 = offset v baudtab
     lda baudtab,x
     sta AUDF3
     lda baudtab+1,x
     sta AUDF4
-    lda #$13                    ; asynchronny prijem odznova
-    sta SKCTL
+    lda #0                      ; init mod resetuje prijimac (zapis $13 pri
+    sta SKCTL                   ; SKCTL=$13 by nic nespravil), ako OS sio.s
     sta SKRES
-    lda #0                      ; a znovuzapnutie zapisovaca IRQ
-    sta IRQEN
+    sta IRQEN                   ; IRQEN len tu (druhy zapis by zahodil
+    lda #$13                    ; prave prijimany bajt)
+    sta SKCTL                   ; asynchronny prijem odznova
     lda #$20
     sta IRQEN
+    lda #$34                    ; motor kazety zapnut
+    sta PACTL
     rts
 
-; next_baud - prepne na druhu rychlost z tabulky.
-; Loader tak precita pasku 6600 aj 9600 bez samostatneho buildu: prvy blok
-; sa nepodari, checksum nesedi a dalsi pokus uz bezi druhou rychlostou.
-; Hlavicka sa na paske posiela dvakrat, takze sa zosynchronizuje este pred
-; prvym datovym blokom.
-next_baud:
-    lda baudidx
-    eor #1
-    sta baudidx
-    jmp set_baud
-
-; getser - prijme jeden bajt z POKEY seriovej linky
-; Vystup: A = bajt, C=0.  C=1 = timeout.
-; X aj Y su zachovane - read_block si v X drzi poziciu v bloku!
-;=============================================================================
-getser:
-    stx save_x
-    sty save_y
-    lda #12                     ; vonkajsie kolo (staci na IRG 1258 ms)
-    sta timeout
-    ldy #0
-    ldx #0
-
-gs_wait:
-    lda IRQST                   ; bit 5 v nule = prijaty bajt
-    and #$20
-    beq gs_have
-    dex
-    bne gs_wait
-    dey
-    bne gs_wait
-    dec timeout
-    bne gs_wait
-    ldx save_x
-    ldy save_y
-    sec
-    rts
-
-gs_have:
-    lda SERIN
-    pha
-    lda #0                      ; vynulovanie a znovuzapnutie zapisovaca IRQ
-    sta IRQEN
-    lda #$20
-    sta IRQEN
-    ldx save_x
-    ldy save_y
-    pla
-    clc
+; motor_off - motor stop, POKEY ticho.  Nici: A
+motor_off:
+    lda #$3C
+    sta PACTL
+    lda #0
+    sta AUDC3
+    sta AUDC4
     rts
 
 ;=============================================================================
@@ -574,134 +1010,166 @@ gs_have:
 ; Riadok lezi v chranenej pamati loadera, takze vypis nikdy neprepise
 ; nahravany program (a program zase neprepise vypis).
 screen_init:
-    lda #0
-    sta DMACTL                  ; DMA von, kym prestavujeme display list
-
-    ldy #39                     ; riadok vyplnime medzerami
-    lda #0
-si_clr:
-    sta scrline,y
-    dey
-    bpl si_clr
-
-    ldy #3                      ; znacka QROS, kym nepride nazov z pasky
+    jsr clr_line
+    ldy #cdata.label_end-cdata.label_txt-1 ; oznacenie loadera, kym nepride nazov
 si_label:
-    lda label_txt,y
-    sta scrline,y
+    lda cdata.label_txt,y
+    sta scrline+NAMECOL,y
     dey
     bpl si_label
+    jmp scr_on
 
-    lda #<dlist
-    sta DLISTL
-    lda #>dlist
-    sta DLISTH
-    lda #$E0                    ; sada znakov OS
-    sta CHBASE
-    lda #$0E                    ; jas textu
-    sta COLPF1
-    lda #$94                    ; pozadie textu
-    sta COLPF2
-    lda #$22                    ; DMA: normalna sirka + display list
-    sta DMACTL
+; wait_key - caka na stlacenie klavesy (SKSTAT bit 2 = 0): najprv na pustenie
+; (klavesa z bootu), potom na stlacenie. Potom sa ukaze pocitadlo.
+wait_key:
+    lda SKSTAT
+    and #$04
+    beq wait_key
+wk_down:
+    lda SKSTAT
+    and #$04
+    bne wk_down
+    lda totblk                  ; pocet blokov pasky zname: percenta,
+    ora totblk+1                ; inak text a pocitadlo blokov
+    bne wk_pct
+    ldy #cdata.cnt_end-cdata.cnt_txt-1
+wk_cnt:
+    lda cdata.cnt_txt,y
+    sta scrline+CNTCOL,y
+    dey
+    bpl wk_cnt
+    jmp show_count              ; hned ukazeme vychodzi stav
+wk_pct:
+    jmp show_pct
 
-    lda #1
-    sta scr_ok
-    jsr show_progress           ; hned ukazeme vychodzi stav
-    rts
+    ert CNTCOL < NAMECOL + 25 + 1               ; za nazvom aspon medzera
+    ert cdata.label_end - cdata.label_txt > CNTCOL - NAMECOL  ; oznacenie po pocitadlo
 
-label_txt   dta $31,$32,$2F,$33 ; "QROS" v obrazovych kodoch
-
-; setup_progress - na zaciatku segmentu urci, z coho pocitame percenta.
-; Ak generator dopisal celkovy pocet blokov pasky, percenta su za celu pasku.
-; Inak beru dlzku prave nahravaneho segmentu (pri jednosegmentovych hrach
-; je to to iste).
-setup_progress:
-    lda total_blk
-    ora total_blk+1
-    beq pg_seg
-    rts
-
-pg_seg:
-    clc                         ; pgtot = (SEGLEN + 127) / 128
-    lda SEGLEN
-    adc #127
-    sta pgtmp
-    lda SEGLEN+1
-    adc #0
-    sta pgtmp+1
-    lda pgtmp                   ; posun o 7 doprava = posun o 1 dolava a vyssi bajt
-    asl
-    lda pgtmp+1
-    rol
-    sta pgtot
+; scr_on - nas riadok do OS tienov a na obrazovku, NMI vypnute. Program,
+; ktory si tiene prepise (nahravaci obrazok), dostane svoj obraz pri dalsom
+; scr_sync - ako pod OS VBI.  Nici: A, X
+scr_on:
     lda #0
-    rol
-    sta pgtot+1
-
-    lda #0                      ; percenta pocitame odznova
-    sta acc
-    sta acc+1
-    sta pct
+    sta NMIEN
+    lda #<dlist
+    sta SDLSTL
+    lda #>dlist
+    sta SDLSTH
+    lda #$E0                    ; znakova sada OS (kopia pod ROM)
+    sta CHBAS
+    lda #$0E                    ; jas textu
+    sta COLOR1
+    lda #$94                    ; pozadie textu
+    sta COLOR2
+    lda #$22                    ; DMA: normalna sirka + display list
+    sta SDMCTL
+; scr_sync - tiene -> hardver, to co robi OS VBI; raz za blok. Farby, PRIOR
+; a CHBASE vzdy (rovnaka hodnota nic nespravi), display list a DMACTL len
+; pri zmene - ANTIC ich berie hned a obraz by uprostred snimky skocil.
+; Nici: A, X
+scr_sync:
+    ldx #8                      ; PCOLR0-3, COLOR0-4 -> COLPM0-3, COLPF0-3, COLBK
+sy_col:
+    lda PCOLR0,x
+    sta COLPM0,x
+    dex
+    bpl sy_col
+    lda GPRIOR
+    sta PRIOR
+    lda CHBAS
+    sta CHBASE
+    lda SDLSTL
+    cmp dl_last
+    bne sy_dl
+    lda SDLSTH
+    cmp dl_last+1
+    bne sy_dl
+    lda SDMCTL
+    cmp dm_last
+    beq sy_ret
+sy_dl:
+    lda SDLSTL
+    sta dl_last
+    sta DLISTL
+    lda SDLSTH
+    sta dl_last+1
+    sta DLISTH
+    lda SDMCTL
+    sta dm_last
+    sta DMACTL
+sy_ret:
     rts
 
-; putscr - A = obrazovy kod znaku, Y = stlpec nasho riadku
-putscr:
+; clr_line - riadok vyplni medzerami.  Vystup: A = 0 (halt na to spolieha)
+clr_line:
+    ldy #39
+    lda #0
+cl_clr:
     sta scrline,y
+    dey
+    bpl cl_clr
     rts
 
-; a2s - prevod ATASCII na obrazovy kod, A = znak
-a2s:
-    and #$7F
-    cmp #$60
-    bcs a2s_done
-    cmp #$20
-    bcc a2s_ctrl
-    sec
-    sbc #$20
-a2s_done:
-    rts
-a2s_ctrl:
-    clc
-    adc #$40
-    rts
-
-; show_name - 25 znakov nazvu z hlavickoveho bloku (offset $08)
+; show_name - az 25 znakov nazvu z hlavickoveho bloku (offset $08).
+; Nazov konci na $9B alebo $00 (pasky z inych generatorov), inak 25 znakov.
 show_name:
-    lda scr_ok
-    beq sn_ret
     lda name_shown
     bne sn_ret
 
-    ldy #24                     ; prazdny nazov neprepisuje znacku
-sn_check:
+    ldx #0                      ; X != 0: nazov ma aj iny znak nez medzeru
+    ldy #0
+sn_scan:
     lda BUFADR+8,y
+    beq sn_scanned
+    cmp #$9B
+    beq sn_scanned
     cmp #$20
-    bne sn_have
-    dey
-    bpl sn_check
-    rts
-sn_have:
-    inc name_shown
+    beq sn_space
+    inx
+sn_space:
+    iny
+    cpy #25
+    bne sn_scan
+sn_scanned:
+    txa                         ; prazdny nazov neprepisuje znacku
+    beq sn_ret
 
-    ldy #24
-sn_loop:
-    sty sn_y
+    inc name_shown
+    ldy #0
+sn_copy:
     lda BUFADR+8,y
-    jsr a2s
-    ldy sn_y
-    jsr putscr
-    ldy sn_y
-    dey
-    bpl sn_loop
+    beq sn_fill
+    cmp #$9B
+    beq sn_fill
+    and #$7F                    ; ATASCII -> obrazovy kod
+    cmp #$60
+    bcs sn_put
+    cmp #$20
+    bcc sn_ctrl
+    sbc #$20                    ; C=1 z cmp, ostane 1
+    bcs sn_put
+sn_ctrl:
+    adc #$40                    ; C=0 z cmp
+sn_put:
+    sta scrline+NAMECOL,y
+    iny
+    cpy #25
+    bne sn_copy
+sn_fill:                        ; za nazvom medzery az po pocitadlo (zmaze
+    lda #0                      ; zvysok oznacenia loadera)
+sn_fl:
+    sta scrline+NAMECOL,y
+    iny
+    cpy #CNTCOL-NAMECOL
+    bne sn_fl
 sn_ret:
     rts
 
 ; bump_progress - o jeden blok dalej
-; Ak pozname celkovy pocet blokov, ukazeme percenta, inak pocitadlo blokov.
+; Percenta len ak generator dopisal total_blk (pocet blokov celej pasky),
+; inak pocitadlo blokov - percenta za segment by pri viacerych segmentoch
+; skakali na 100 % a odznova.
 bump_progress:
-    lda scr_ok
-    beq bp_ret
-
     ldx #3                      ; desiatkove pocitadlo nacitanych blokov
 bp_count:
     inc cdig,x
@@ -714,174 +1182,91 @@ bp_count:
     bpl bp_count
 bp_counted:
 
-    lda pgtot                   ; nula = este nevieme z coho ratat percenta
-    ora pgtot+1
-    bne bp_pct
-    jmp show_count
+    lda totblk                  ; nula = pocet blokov pasky nepozname
+    ora totblk+1
+    beq show_count
 
-bp_pct:
-    clc                         ; acc = acc + 100
-    lda acc
+    lda acc                     ; acc += 100
+    clc
     adc #100
-    sta acc
-    lda acc+1
-    adc #0
-    sta acc+1
-
-bp_loop:
-    lda acc+1                   ; kym acc >= pgtot, uber pgtot a pripocitaj 1
-    cmp pgtot+1
-    bcc bp_show
-    bne bp_sub
-    lda acc
-    cmp pgtot
-    bcc bp_show
-bp_sub:
+    bcc bp_div
+    inc acc+1
+bp_div:
     sec
-    lda acc
-    sbc pgtot
-    sta acc
+bp_loop:                        ; kym acc >= totblk, uber ho a pripocitaj 1
+    sta acc                     ; A = nizky bajt acc
+    sbc totblk
+    tax
     lda acc+1
-    sbc pgtot+1
+    sbc totblk+1
+    bcc show_pct                ; acc < totblk
     sta acc+1
-    inc pct
-    jmp bp_loop
-
-bp_show:
-    jsr show_pct
-bp_ret:
-    rts
+    txa
+    inc pct                     ; C=1 ostava; pct <= 100, nikdy 0
+    bne bp_loop
 
 ; show_pct - vypise pct ako tri cislice a znak percenta od stlpca PCTCOL
-; show_progress - percenta alebo pocitadlo, podla toho co vieme
-show_progress:
-    lda scr_ok
-    beq sp_ret
-    lda pgtot
-    ora pgtot+1
-    bne show_pct
-    jmp show_count
-
 show_pct:
     lda pct
-    ldx #0
+    ldx #$10-1                  ; stovky ako obrazovy kod cislice
+    sec
 sp_h:
-    cmp #100
-    bcc sp_hd
+    inx
     sbc #100
-    inx
-    jmp sp_h
-sp_hd:
-    stx dig0
-    ldx #0
+    bcs sp_h
+    adc #100                    ; vrati zvysok, C=1 (A + 256)
+    ldy #$10-1                  ; desiatky
 sp_t:
-    cmp #10
-    bcc sp_td
+    iny
     sbc #10
-    inx
-    jmp sp_t
-sp_td:
-    stx dig1
-    sta dig2
+    bcs sp_t
+    adc #$10+10                 ; jednotky ako obrazovy kod (C=0)
+    sta scrline+PCTCOL+2
 
-    lda dig0                    ; stovky (prazdne, ak nula)
-    beq sp_h_blank
-    ora #$10
-    bne sp_h_put
-sp_h_blank:
-    lda #0
-sp_h_put:
-    ldy #PCTCOL
-    jsr putscr
-
-    lda dig0                    ; desiatky (prazdne, ak cele cislo pod 10)
-    ora dig1
-    beq sp_t_blank
-    lda dig1
-    ora #$10
-    bne sp_t_put
-sp_t_blank:
-    lda #0
-sp_t_put:
-    ldy #PCTCOL+1
-    jsr putscr
-
-    lda dig2                    ; jednotky
-    ora #$10
-    ldy #PCTCOL+2
-    jsr putscr
-
+    cpx #$10                    ; nulove stovky -> medzera
+    bne sp_put
+    ldx #0
+    cpy #$10                    ; a pod 10 aj nulove desiatky
+    bne sp_put
+    ldy #0
+sp_put:
+    stx scrline+PCTCOL
+    sty scrline+PCTCOL+1
     lda #$05                    ; obrazovy kod znaku percenta
-    ldy #PCTCOL+3
-    jsr putscr
-sp_ret:
+    sta scrline+PCTCOL+3
     rts
 
 ; show_count - vypise pocitadlo blokov ako styri cislice
 show_count:
-    lda scr_ok
-    beq sc_ret
     ldx #0
-    ldy #PCTCOL
-    lda #1
-    sta sc_lead                 ; este sme nevypisali nenulovu cislicu
-sc_loop:
+sc_lead:                        ; uvodne nuly -> medzery (posledna cislica vzdy)
     lda cdig,x
-    bne sc_digit
-    cpx #3                      ; posledna cislica sa vypise vzdy
-    beq sc_digit
-    lda sc_lead
-    beq sc_digit
-    lda #0                      ; uvodna nula -> medzera
     bne sc_put
-    beq sc_put
-sc_digit:
-    lda #0
-    sta sc_lead
+    sta scrline+PCTCOL,x
+    inx
+    cpx #3
+    bne sc_lead
+sc_dig:
     lda cdig,x
-    ora #$10
 sc_put:
-    sty sc_y
-    jsr putscr
-    ldy sc_y
-    iny
+    ora #$10
+    sta scrline+PCTCOL,x
     inx
     cpx #4
-    bne sc_loop
-sc_ret:
+    bne sc_dig
     rts
 
-;=============================================================================
-; Premenne
-;=============================================================================
-bufpos     dta 0                ; pozicia v datovej casti bloku
-bufcnt     dta 0                ; pocet platnych bajtov v bloku
-exp_lo     dta 0                ; ocakavany index dalsieho bloku
-exp_hi     dta 0
-retries    dta 0
-timeout    dta 0
-collide    dta 0                ; program sa pokusil prepisat loader
-save_x     dta 0
-save_y     dta 0
-sn_y       dta 0
-scr_ok     dta 0
-name_shown dta 0
-halt_col   dta 0                ; farba okraja pri chybe
-halt_idx   dta 0                ; index chyboveho textu
-hl_y       dta 0
-pgtot      dta a(0)             ; z coho ratame percenta (bloky)
-pgtmp      dta a(0)
-baudidx    dta 0                ; ktora rychlost z tabulky sa prave skusa
-baudtab    dta a(0), a(0)       ; dva skusane POKEY delice
-pct        dta 0
-dig0       dta 0
-dig1       dta 0
-dig2       dta 0
-sc_lead    dta 0
-sc_y       dta 0
-cdig       dta 0,0,0,0          ; desiatkove pocitadlo nacitanych blokov
-acc        dta a(0)             ; akumulator percent
-
+; --- chybove texty (obrazove kody, ukoncene $FF) ----------------------------
+msgs
+msg_pre     dta d'CHYBA - ', $FF
+msg_sync    dta d'NEZNAMY FORMAT', $FF
+msg_block   dta d'NECITATELNY BLOK', $FF
+msg_norun   dta d'CHYBA RUN ADRESA', $FF
+msg_coll    dta d'PREPISUJE LOADER', $FF
+msg_end
+    ert msg_pre <> msgs
+    ert msg_end - msgs > 256
+    ert [msg_sync - msg_pre - 1] + [msg_end - msg_coll - 1] > 40
 
 ; --- vlastny display list: 24 prazdnych riadkov + jeden textovy riadok -------
 dlist
@@ -889,9 +1274,20 @@ dlist
     dta $42, a(scrline)
     dta $41, a(dlist)
 
-scrline
-    dta 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
-    dta 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+    ert [dlist & $FC00] <> [[dlist + 8] & $FC00]        ; DL cez 1K hranicu
+    ert [scrline & $F000] <> [[scrline + 39] & $F000]   ; riadok cez 4K hranicu
+
+    .endl
+MAIN_LEN = * - main_load
+    ert MAIN_ADR + [[MAIN_LEN + 255] & $FF00] > [LOADER_HI * 256]  ; kod po strankach do $DFFF
+    ert >[BUFADR + 3] <> >[BUFADR + 130]             ; data bloku v jednej stranke
+    ert BUFADR + 132 > ZPSHAD                        ; buffer pred tienom
+    ert VARS_END > BUFADR                            ; premenne pred bufferom
+    ert >VARS <> LOADER_LO
+
+; QROS OS data (ostavaju v blobe, stub ich pouzije pred nahravanim)
+qrosos:
+    icl 'qrosos.inc'
 
 ; Dopisatelne parametre na konci blobu (generator ich meni podla pasky):
 ;   baudiv    na offsete dlzka-4  - POKEY delic prenosovej rychlosti
@@ -900,8 +1296,7 @@ scrline
 ; by hodnotu z -d:DIVISOR (adresa labelu namiesto delica).
 baudiv     dta a(DIVISOR)
 total_blk  dta a(0)
-
-bin_end:
+blob_end:
 
 ;=============================================================================
 ; XEX zostavenie: adresa spustenia
