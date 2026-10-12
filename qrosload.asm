@@ -795,7 +795,9 @@ nb_next:
     beq nb_next                 ; nastavovaci blok len preskocime
     cmp #$FE
     bne nb_skip
-    rts                         ; koniec suboru, C=1 z cmp
+    jsr data_yet                ; koncovy blok cudzieho programu (paska pustena
+    bcc nb_next                 ; uprostred) sa preskoci, hladame dalej
+    rts                         ; koniec suboru, C=1 z data_yet
 
 ; Blok sa necita: ak zacal po medzere (ciste), je zla rychlost - skusime
 ; dalsiu z tabulky. Ak sme don vbehli uprostred, len sa zarovname na dalsiu
@@ -807,15 +809,21 @@ nb_bad:                         ; Z = (gapcur = 0) z read_block (lda pred rts)
     beq nb_skip
     jsr next_baud
 nb_skip:
-    ldx exp_hi                  ; ocakavany index 2 = este nic nenacitane
-    bne nb_cnt
-    ldx exp_lo
-    cpx #3
-    bcc nb_next
-nb_cnt:
+    jsr data_yet
+    bcc nb_next                 ; pred prvym datovym blokom bez limitu
     dec retries
     bne nb_next
     jmp e_block
+
+; data_yet - C=1, ak uz prisiel prvy datovy blok (ocakavany index > 2).
+; Dovtedy loader len hlada: preskakuje cudzie bloky (iny index), koncove
+; bloky aj sum a nic nehlasi.  Nici: A
+data_yet:
+    lda exp_lo
+    cmp #3
+    lda exp_hi
+    sbc #0
+    rts
 
 nb_header:
     jsr show_name               ; hlavicka - vypiseme nazov programu
