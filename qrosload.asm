@@ -800,11 +800,19 @@ nb_next:
 ; Blok sa necita: ak zacal po medzere (ciste), je zla rychlost - skusime
 ; dalsiu z tabulky. Ak sme don vbehli uprostred, len sa zarovname na dalsiu
 ; medzeru. Blok s dobrym suctom, ale zlym typom alebo poradim, preskocime.
-; Pocet pokusov je obmedzeny, aby sa loader nikdy nezacyklil.
+; Pocet pokusov je obmedzeny, aby sa loader nikdy nezacyklil - ale az od
+; prveho datoveho bloku: pred nim ide z realneho magnetofonu sum (prazdna
+; paska, rozbeh) a cakat treba, kym nepride paska.
 nb_bad:                         ; Z = (gapcur = 0) z read_block (lda pred rts)
     beq nb_skip
     jsr next_baud
 nb_skip:
+    ldx exp_hi                  ; ocakavany index 2 = este nic nenacitane
+    bne nb_cnt
+    ldx exp_lo
+    cpx #3
+    bcc nb_next
+nb_cnt:
     dec retries
     bne nb_next
     jmp e_block
